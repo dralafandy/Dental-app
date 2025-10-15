@@ -186,9 +186,22 @@ def add_patient(name, age=None, gender=None, phone=None, address=None, medical_h
         return patient.id
 
 def get_patients():
-    with get_session() as session:
-        return session.query(Patient).order_by(Patient.id).all()
-
+    session = Session()
+    patients = session.query(Patient).all()
+    data = []
+    for p in patients:
+        data.append({
+            "id": p.id,
+            "name": p.name,
+            "age": p.age,
+            "gender": p.gender,
+            "phone": p.phone,
+            "address": p.address,
+            "medical_history": p.medical_history,
+            "image_path": p.image_path
+        })
+    session.close()
+    return data
 def get_patient(patient_id):
     with get_session() as session:
         return session.get(Patient, patient_id)
