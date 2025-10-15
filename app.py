@@ -20,11 +20,6 @@ from reportlab.pdfgen import canvas
 import plotly.express as px
 
 # ---------------------------
-# IMPORTANT: set_page_config MUST be the first Streamlit command (after imports)
-# ---------------------------
-st.set_page_config(page_title="عيادة الأسنان - متكامل", layout="wide", page_icon="🦷")
-
-# ---------------------------
 # Configuration
 # ---------------------------
 DB_URI = "sqlite:///dental_clinic.db"
@@ -161,7 +156,7 @@ class SupplierTransaction(Base):
     supplier_id = Column(Integer, ForeignKey("suppliers.id"))
     date = Column(DateTime, default=datetime.datetime.now)
     description = Column(String)
-    amount = Column(Float)  # موجب للمورد (دفعنا له)
+    amount = Column(Float)  # موجب للمورد (دفعنا له) أو سالب (مستحق علينا)
     payment_method = Column(String)
     supplier = relationship("Supplier", back_populates="transactions")
 
@@ -616,6 +611,7 @@ def get_daily_summary(date):
     with session_scope() as s:
         payments = s.query(Payment).filter(Payment.date_paid.between(start, end)).all()
         income_from_payments = sum((p.paid_amount or 0.0) for p in payments)
+        # compute clinic/doctor shares from payments for accuracy
         clinic_income_from_payments = sum((p.clinic_share or 0.0) for p in payments)
         doctor_income_from_payments = sum((p.doctor_share or 0.0) for p in payments)
         daily_entries = s.query(DailyTransaction).filter(DailyTransaction.date.between(start, end)).all()
@@ -623,11 +619,13 @@ def get_daily_summary(date):
         total_expense_from_daily = sum((d.expense or 0.0) for d in daily_entries)
         expenses = s.query(Expense).filter(Expense.date.between(start, end)).all()
         total_expenses = sum((e.amount or 0.0) for e in expenses) + total_expense_from_daily
+        # appointments count and unique patients
         appointments = s.query(Appointment).filter(Appointment.date.between(start, end)).all()
         patients_count = len(set(a.patient_id for a in appointments))
         appointments_count = len(appointments)
+        # final sums
         total_income = income_from_payments + extra_income
-        clinic_income = clinic_income_from_payments
+        clinic_income = clinic_income_from_payments  # plus any clinic-specific extra incomes if needed
         doctor_income = doctor_income_from_payments
         net_profit = clinic_income - total_expenses
         return {
@@ -703,7 +701,7 @@ def app_header_white():
 # ---------------------------
 
 def dashboard_page():
-    st.header("الملخّص العام")
+    st.header("لوحة التحكم")
     today = datetime.date.today()
     summary = get_daily_summary(today)
     patients = get_patients(); appointments = get_appointments()
@@ -896,10 +894,12 @@ def inventory_page_ui():
 def daily_entry_ui():
     st.header("الإدخال اليومي (حالات منجزة وحساب تلقائي للنسب)")
     sessions_t = get_treatments(); sessions_d = get_doctors()
+    # We'll allow multiple rows of entries dynamically via number_input
     rows_count = st.number_input("كم حالة تريد إدخالها الآن؟", min_value=1, max_value=20, value=3, step=1)
     with st.form("daily_entry_form"):
         date = st.date_input("تاريخ الحالات", value=datetime.date.today())
         entries = []
+        cols = []
         for i in range(int(rows_count)):
             c1, c2, c3, c4 = st.columns([3,3,2,4])
             with c1:
@@ -916,9 +916,11 @@ def daily_entry_ui():
         extra_expenses = st.number_input("مصروفات إضافية اليوم", min_value=0.0, value=0.0)
         notes = st.text_area("ملاحظات عامة لملخّص اليوم")
         if st.form_submit_button("حفظ الإدخال اليومي"):
+            # compute totals
             total_income = 0.0
             clinic_income = 0.0
             doctor_income = 0.0
+            # For each entry, compute shares using TreatmentPercentage if exists
             with session_scope() as s:
                 for t_choice, d_choice, cost, note in entries:
                     if not t_choice or not d_choice or (cost is None) or cost <= 0:
@@ -928,6 +930,7 @@ def daily_entry_ui():
                         d_id = int(d_choice.split(" - ")[0])
                     except Exception:
                         continue
+                    # find perc
                     perc = s.query(TreatmentPercentage).filter_by(treatment_id=t_id, doctor_id=d_id).first()
                     if perc:
                         clinic_share = (perc.clinic_percentage or 50.0) * cost / 100.0
@@ -938,7 +941,11 @@ def daily_entry_ui():
                     total_income += cost
                     clinic_income += clinic_share
                     doctor_income += doctor_share
+                # also include daily transactions incomes (if any added manually) - we treat extra income as not doctor-related
+                # total expenses = extra_expenses + any Expense records entered for the day
+                # Save summary
                 net_profit = clinic_income - float(extra_expenses or 0.0)
+                # Save to DB
                 ds = DailySummary(date=datetime.datetime.combine(date, datetime.datetime.min.time()), total_income=total_income, clinic_income=clinic_income, doctor_income=doctor_income, total_expenses=float(extra_expenses or 0.0), net_profit=net_profit, notes=notes)
                 s.add(ds)
                 s.flush()
@@ -952,85 +959,109 @@ def daily_summary_ui():
     if not df.empty:
         fig = px.bar(df, x="date", y=["clinic_income","doctor_income","net_profit"], title="ملخّصات يومية")
         st.plotly_chart(fig, use_container_width=True)
+    # export
     if st.button("تحميل ملخّصات كـ Excel"):
         bytes_x = df_to_excel_bytes(df)
         st.download_button("تحميل Excel", data=bytes_x, file_name="daily_summaries.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+from sqlalchemy.orm import joinedload
+
 def financial_reports_page():
-    st.header("التقارير المالية المتقدمة")
-    with st.sidebar:
-        st.subheader("تحديد الفترة")
-        start_date = st.date_input("من", datetime.date.today() - datetime.timedelta(days=30))
-        end_date = st.date_input("إلى", datetime.date.today())
-    payments = get_payments()
-    expenses = get_expenses()
-    daily = get_daily_summaries()
-    doctors = get_doctors()
-    treatments = get_treatments()
+    st.title("📊 التقارير المالية المتقدمة")
+
+    session = Session()
+    payments = session.query(Payment).options(
+        joinedload(Payment.appointment)
+        .joinedload(Appointment.patient),
+        joinedload(Payment.appointment)
+        .joinedload(Appointment.doctor),
+        joinedload(Payment.appointment)
+        .joinedload(Appointment.treatment)
+    ).all()
+
+    expenses = session.query(Expense).all()
+    session.close()
+
+
+    if not payments and not expenses:
+        st.info("لا توجد بيانات مالية بعد.")
+        return
+
+    st.subheader("تحديد الفترة الزمنية للتقرير")
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("تاريخ البداية", datetime.date.today().replace(day=1))
+    with col2:
+        end_date = st.date_input("تاريخ النهاية", datetime.date.today())
+
+    # ---- بيانات المدفوعات ----
     df_pay = pd.DataFrame([{
-        "التاريخ": p["date_paid"].date() if p["date_paid"] else None,
-        "الإجمالي": p["total_amount"],
-        "المدفوع": p["paid_amount"],
-        "دخل العيادة": p["clinic_share"],
-        "دخل الطبيب": p["doctor_share"],
-        "الخصم": p["discounts"],
-        "الضرائب": p["taxes"]
-    } for p in payments]) if payments else pd.DataFrame()
-    df_exp = pd.DataFrame([{"التاريخ": e["date"].date() if e["date"] else None, "المصروف": e["amount"], "الوصف": e["description"]} for e in expenses]) if expenses else pd.DataFrame()
-    df_daily = pd.DataFrame([{"التاريخ": d["date"].date() if d["date"] else None, "إجمالي الدخل": d["total_income"], "دخل العيادة": d["clinic_income"], "دخل الأطباء": d["doctor_income"], "المصروفات": d["total_expenses"], "الصافي": d["net_profit"]} for d in daily]) if daily else pd.DataFrame()
+        "رقم العملية": p.id,
+        "اسم المريض": p.appointment.patient.name if p.appointment and p.appointment.patient else "غير محدد",
+        "الطبيب": p.appointment.doctor.name if p.appointment and p.appointment.doctor else "غير محدد",
+        "العلاج": p.appointment.treatment.name if p.appointment and p.appointment.treatment else "غير محدد",
+        "المبلغ الكلي": p.total_amount,
+        "المدفوع": p.paid_amount,
+        "نسبة العيادة": p.clinic_share,
+        "نسبة الطبيب": p.doctor_share,
+        "الخصومات": p.discounts,
+        "الضرائب": p.taxes,
+        "التاريخ": p.date_paid
+    } for p in payments])
+
     if not df_pay.empty:
-        df_pay = df_pay[(df_pay["التاريخ"] >= pd.to_datetime(start_date)) & (df_pay["التاريخ"] <= pd.to_datetime(end_date))]
+        # تحويل عمود التاريخ إلى نوع تاريخي
+        df_pay["التاريخ"] = pd.to_datetime(df_pay["التاريخ"]).dt.date
+
+        # فلترة حسب المدة المحددة
+        df_pay = df_pay[(df_pay["التاريخ"] >= start_date) & (df_pay["التاريخ"] <= end_date)]
+
+    # ---- بيانات المصروفات ----
+    df_exp = pd.DataFrame([{
+        "الوصف": e.description,
+        "المبلغ": e.amount,
+        "التاريخ": e.date
+    } for e in expenses])
+
     if not df_exp.empty:
-        df_exp = df_exp[(df_exp["التاريخ"] >= pd.to_datetime(start_date)) & (df_exp["التاريخ"] <= pd.to_datetime(end_date))]
-    if not df_daily.empty:
-        df_daily = df_daily[(df_daily["التاريخ"] >= pd.to_datetime(start_date)) & (df_daily["التاريخ"] <= pd.to_datetime(end_date))]
-    total_income = df_pay["الإجمالي"].sum() if not df_pay.empty else 0.0
-    total_clinic = df_pay["دخل العيادة"].sum() if not df_pay.empty else 0.0
-    total_doctors = df_pay["دخل الطبيب"].sum() if not df_pay.empty else 0.0
-    total_expenses = df_exp["المصروف"].sum() if not df_exp.empty else 0.0
-    st.subheader("الملخّص")
-    col1,col2,col3 = st.columns(3)
-    col1.metric("إجمالي الدخل", format_money(total_income))
-    col2.metric("دخل العيادة", format_money(total_clinic))
-    col3.metric("دخل الأطباء", format_money(total_doctors))
-    st.metric("صافي الربح (عيادة - مصروفات)", format_money(total_clinic - total_expenses))
-    if not df_daily.empty:
-        st.subheader("تطوّر الدخل اليومي")
-        fig = px.line(df_daily, x="التاريخ", y=["دخل العيادة","دخل الأطباء","الصافي"], markers=True)
+        df_exp["التاريخ"] = pd.to_datetime(df_exp["التاريخ"]).dt.date
+        df_exp = df_exp[(df_exp["التاريخ"] >= start_date) & (df_exp["التاريخ"] <= end_date)]
+
+    # ---- حساب الإجماليات ----
+    total_income = df_pay["المدفوع"].sum() if not df_pay.empty else 0
+    total_expenses = df_exp["المبلغ"].sum() if not df_exp.empty else 0
+    clinic_net = total_income - total_expenses
+
+    st.subheader("الملخص المالي")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("إجمالي الدخل", f"{total_income:,.2f} جنيه")
+    with c2:
+        st.metric("إجمالي المصروفات", f"{total_expenses:,.2f} جنيه")
+    with c3:
+        st.metric("صافي العيادة", f"{clinic_net:,.2f} جنيه")
+
+    # ---- عرض التفاصيل ----
+    with st.expander("عرض تفاصيل الإيرادات"):
+        st.dataframe(df_pay, use_container_width=True)
+
+    with st.expander("عرض تفاصيل المصروفات"):
+        st.dataframe(df_exp, use_container_width=True)
+
+    # ---- رسم بياني ----
+    if not df_pay.empty or not df_exp.empty:
+        combined_data = []
+        if not df_pay.empty:
+            for _, r in df_pay.iterrows():
+                combined_data.append({"التاريخ": r["التاريخ"], "النوع": "إيراد", "القيمة": r["المدفوع"]})
+        if not df_exp.empty:
+            for _, r in df_exp.iterrows():
+                combined_data.append({"التاريخ": r["التاريخ"], "النوع": "مصروف", "القيمة": -r["المبلغ"]})
+        df_chart = pd.DataFrame(combined_data)
+        df_chart = df_chart.groupby(["التاريخ", "النوع"]).sum().reset_index()
+        st.subheader("التحليل الزمني")
+        fig = px.line(df_chart, x="التاريخ", y="القيمة", color="النوع", markers=True)
         st.plotly_chart(fig, use_container_width=True)
-    if not df_exp.empty:
-        st.subheader("توزيع المصروفات حسب الوصف")
-        fig2 = px.pie(df_exp.groupby("الوصف")["المصروف"].sum().reset_index(), values="المصروف", names="الوصف")
-        st.plotly_chart(fig2, use_container_width=True)
-    st.subheader("تقرير الأطباء")
-    doc_rows = []
-    with session_scope() as s:
-        for d in doctors:
-            payments_doc = s.query(Payment).join(Appointment).filter(Appointment.doctor_id == d["id"]).all()
-            income_doc = sum((p.doctor_share or 0.0) for p in payments_doc)
-            cases = len(payments_doc)
-            doc_rows.append({"الطبيب": d["name"], "دخل الطبيب": income_doc, "عدد الحالات": cases})
-    df_doc = pd.DataFrame(doc_rows) if doc_rows else pd.DataFrame()
-    st.dataframe(df_doc, use_container_width=True)
-    if not df_doc.empty:
-        fig_doc = px.bar(df_doc, x="الطبيب", y="دخل الطبيب", title="دخل كل طبيب")
-        st.plotly_chart(fig_doc, use_container_width=True)
-    st.subheader("تحليل العلاجات")
-    treat_rows = []
-    with session_scope() as s:
-        for t in treatments:
-            payments_tr = s.query(Payment).join(Appointment).filter(Appointment.treatment_id == t["id"]).all()
-            income_tr = sum((p.total_amount or 0.0) for p in payments_tr)
-            treat_rows.append({"العلاج": t["name"], "الدخل": income_tr})
-    df_tr = pd.DataFrame(treat_rows) if treat_rows else pd.DataFrame()
-    st.dataframe(df_tr, use_container_width=True)
-    if not df_tr.empty:
-        fig_tr = px.bar(df_tr, x="العلاج", y="الدخل", title="أكثر العلاجات دخلاً")
-        st.plotly_chart(fig_tr, use_container_width=True)
-    st.subheader("تصدير")
-    if not df_daily.empty:
-        csv = df_daily.to_csv(index=False).encode("utf-8")
-        st.download_button("تحميل (CSV) ملخّص يومي", csv, "daily_summary_filtered.csv", "text/csv")
 
 def suppliers_page_ui():
     st.header("الموردين والمعامل")
@@ -1119,26 +1150,11 @@ def download_db_button():
 # Main
 # ---------------------------
 def main():
+    st.set_page_config(page_title="عيادة الأسنان - متكامل", layout="wide", page_icon="🦷")
     local_css_white(); app_header_white()
 
-    menu = st.sidebar.selectbox("القسم", [
-        "الملخّص العام",
-        "المرضى",
-        "الأطباء",
-        "العلاجات",
-        "المواعيد",
-        "الدفعات",
-        "المصروفات",
-        "المخزون",
-        "الإدخال اليومي",
-        "الملخص اليومي",
-        "التقارير المالية",
-        "الموردين",
-        "تفاصيل مورد",
-        "تقارير الموردين",
-        "نسخة احتياطية"
-    ])
-    if menu == "الملخّص العام": dashboard_page()
+    menu = st.sidebar.selectbox("القسم", ["لوحة التحكم","المرضى","الأطباء","العلاجات","المواعيد","الدفعات","المصروفات","المخزون","الإدخال اليومي","الملخص اليومي","التقارير المالية","الموردين","تفاصيل مورد","تقارير الموردين","نسخة احتياطية"])
+    if menu == "لوحة التحكم": dashboard_page()
     elif menu == "المرضى": patients_page_ui()
     elif menu == "الأطباء": doctors_page_ui()
     elif menu == "العلاجات": treatments_page_ui()
