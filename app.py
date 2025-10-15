@@ -558,15 +558,7 @@ def patients_page(num_cols):
 
     st.markdown("---")
     patients = get_patients()
-    df = pd.DataFrame([{
-        "ID": p.id,
-        "الاسم": p.name,
-        "العمر": p.age,
-        "الجنس": p.gender or "",
-        "الهاتف": p.phone or "",
-        "العنوان": p.address or ""
-    } for p in patients])
-
+    df = pd.DataFrame(patients)
     search = st.text_input("بحث (اسم، هاتف، عنوان)")
     if search:
         mask = df.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
